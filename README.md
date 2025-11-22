@@ -1,6 +1,6 @@
-# Webhook Pharow → Odoo
+# Webhook Pharow → Odoo + Cloud Tasks
 
-A Flask application that receives webhook payloads from Pharow and converts them into Odoo CRM leads, with duplicate detection.
+A Flask application that receives webhook payloads from Pharow, converts them into Odoo CRM leads with duplicate detection, and queues mail generation tasks in Google Cloud Tasks.
 
 ## Features
 
@@ -8,14 +8,19 @@ A Flask application that receives webhook payloads from Pharow and converts them
 - **Duplicate detection**: Checks if a lead already exists before creating it
 - **Smart address parsing**: Extracts street, zip code, and city from full addresses
 - **Rich lead descriptions**: Builds detailed descriptions with company and person information
+- **Cloud Tasks integration**: Automatically queues mail generation tasks for each new lead
 - **Cloud Run ready**: Configured for deployment on Google Cloud Run
 
 ## Environment Variables
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `ODOO_DB_URL` | Base URL of your Odoo instance | `https://www.lightandshutter.fr` |
-| `ODOO_SECRET` | API token for authentication | `Bearer token...` |
+| Variable | Description | Required | Example |
+|----------|-------------|----------|---------|
+| `ODOO_DB_URL` | Base URL of your Odoo instance | ✅ | `https://www.lightandshutter.fr` |
+| `ODOO_SECRET` | API token for Odoo authentication | ✅ | `Bearer token...` |
+| `GCP_PROJECT_ID` | Google Cloud Project ID | ✅ | `my-project-123` |
+| `GCP_REGION` | Google Cloud region | ❌ | `europe-west1` (default) |
+| `CLOUD_TASKS_QUEUE` | Cloud Tasks queue name | ❌ | `mail-writer-queue` (default) |
+| `MAIL_WRITER_ENDPOINT` | URL of the mail-writer service | ✅ | `https://mail-writer-xxx.a.run.app` |
 
 ## API Endpoints
 
@@ -126,6 +131,60 @@ Before creating a lead, the system searches Odoo for existing leads with the sam
 }
 ```
 
+## Cloud Tasks Integration
+
+After successfully creating leads in Odoo, the webhook automatically creates tasks in Google Cloud Tasks. Each task calls the mail-writer service to generate a personalized prospection email.
+
+### How it works:
+
+1. **Pharow webhook received** → Leads created in Odoo
+2. **For each new lead** → Cloud Tasks queues a mail generation task
+3. **Cloud Tasks** → Calls the mail-writer service with:
+   ```json
+   {
+     "first_name": "John",
+     "last_name": "Doe",
+     "email": "john.doe@example.com",
+     "website": "https://www.example.com",
+     "partner_name": "Example Inc.",
+     "function": "Marketing Director",
+     "description": "Leading innovative software solutions"
+   }
+   ```
+4. **Mail-writer service** → Generates subject and body, then creates a Gmail draft
+5. **Gmail Draft** → Ready to be reviewed and sent
+
+### Cloud Tasks Queue Setup
+
+Before deploying, create a Cloud Tasks queue:
+
+```bash
+gcloud tasks queues create mail-writer-queue \
+  --location=europe-west1 \
+  --max-dispatches-per-second=10 \
+  --max-concurrent-dispatches=5
+```
+
+### Response with Cloud Tasks
+
+Successful response now includes task creation info:
+
+```json
+{
+  "status": "ok",
+  "odoo_status": "ok",
+  "odoo_response": {
+    "id": 12345,
+    "tasks_created": [
+      {
+        "status": "task_created",
+        "task_name": "projects/my-project/locations/europe-west1/queues/mail-writer-queue/tasks/abc123..."
+      }
+    ]
+  }
+}
+```
+
 ## Local Development
 
 ```bash
@@ -144,12 +203,46 @@ The app will be available at `http://localhost:8080`
 
 ## Deployment on Cloud Run
 
+### Prerequisites
+
+1. Create the Cloud Tasks queue:
 ```bash
-gcloud run deploy webhook-test \
+gcloud tasks queues create mail-writer-queue \
+  --location=europe-west1 \
+  --max-dispatches-per-second=10 \
+  --max-concurrent-dispatches=5
+```
+
+2. Get the mail-writer service URL (if already deployed):
+```bash
+gcloud run services describe mail-writer --region europe-west1 --format='value(status.url)'
+```
+
+### Deploy the webhook service
+
+```bash
+gcloud run deploy pharow-to-odoo \
   --source . \
   --region europe-west1 \
   --allow-unauthenticated \
-  --set-env-vars ODOO_DB_URL="https://your-odoo-instance.com",ODOO_SECRET="your-api-token"
+  --memory 1Gi \
+  --set-env-vars \
+    ODOO_DB_URL="https://your-odoo-instance.com",\
+    ODOO_SECRET="your-api-token",\
+    GCP_PROJECT_ID="your-gcp-project-id",\
+    GCP_REGION="europe-west1",\
+    CLOUD_TASKS_QUEUE="mail-writer-queue",\
+    MAIL_WRITER_ENDPOINT="https://mail-writer-xxx.a.run.app"
+```
+
+### Grant necessary IAM permissions
+
+The Cloud Run service account needs permission to create tasks:
+
+```bash
+gcloud projects add-iam-policy-binding your-gcp-project-id \
+  --member=serviceAccount:pharow-to-odoo@your-gcp-project-id.iam.gserviceaccount.com \
+  --role=roles/cloudtasks.enqueuer
 ```
 
 ## Troubleshooting
@@ -169,6 +262,33 @@ Check the logs for detailed error messages. The app logs:
 ### Address Not Parsed
 The parser expects format: `{number} {street} {zipcode} {city}`
 Example: `89 Rue Nationale 59000 Lille`
+
+### Cloud Tasks Not Created
+1. Verify `GCP_PROJECT_ID` is set correctly
+2. Verify `MAIL_WRITER_ENDPOINT` is set and accessible
+3. Check that the Cloud Run service account has `roles/cloudtasks.enqueuer` permission
+4. Verify the Cloud Tasks queue exists:
+   ```bash
+   gcloud tasks queues list --location=europe-west1
+   ```
+5. Check Cloud Logging for Cloud Tasks errors
+
+### Debugging Cloud Tasks
+
+View queue stats:
+```bash
+gcloud tasks queues describe mail-writer-queue --location=europe-west1
+```
+
+View task details:
+```bash
+gcloud tasks list --queue=mail-writer-queue --location=europe-west1
+```
+
+View Cloud Logging:
+```bash
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=pharow-to-odoo" --limit=50 --format=json
+```
 
 ## Logging
 

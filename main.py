@@ -1,8 +1,37 @@
 import os
 import requests
+import json
 from flask import Flask, request, jsonify
+from google.cloud import tasks_v2
+from google.protobuf import timestamp_pb2
+import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
+
+# -------------------------------------------------------------------
+# Session with retry strategy
+# -------------------------------------------------------------------
+
+def create_requests_session():
+    """
+    Crée une session requests avec retry strategy pour gérer les connexions instables.
+    """
+    session = requests.Session()
+    
+    retry_strategy = Retry(
+        total=3,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["POST", "GET"],
+        backoff_factor=1
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
 
 # -------------------------------------------------------------------
 # Config Odoo
@@ -12,6 +41,15 @@ ODOO_DB_URL = os.environ.get("ODOO_DB_URL")  # à définir dans Cloud Run (base 
 ODOO_SECRET = os.environ.get("ODOO_SECRET")  # à définir dans Cloud Run
 ODOO_ENDPOINT = "/json/2/crm.lead/create"
 ODOO_FULL_URL = f"{ODOO_DB_URL}{ODOO_ENDPOINT}" if ODOO_DB_URL else None
+
+# -------------------------------------------------------------------
+# Config Cloud Tasks
+# -------------------------------------------------------------------
+
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")  # à définir dans Cloud Run
+GCP_REGION = os.environ.get("GCP_REGION", "europe-west1")  # à définir dans Cloud Run
+CLOUD_TASKS_QUEUE = os.environ.get("CLOUD_TASKS_QUEUE", "mail-writer-queue")  # à définir dans Cloud Run
+MAIL_WRITER_ENDPOINT = os.environ.get("MAIL_WRITER_ENDPOINT")  # à définir dans Cloud Run (ex: https://mail-writer-xxx.a.run.app)
 
 
 # -------------------------------------------------------------------
@@ -196,6 +234,7 @@ def search_existing_lead(external_id: str) -> list:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {ODOO_SECRET}",
+        "Connection": "keep-alive"
     }
     
     payload = {
@@ -207,7 +246,8 @@ def search_existing_lead(external_id: str) -> list:
     print(f"[DEBUG] Payload recherche : {payload}")
 
     try:
-        resp = requests.post(search_url, headers=headers, json=payload, timeout=10)
+        session = create_requests_session()
+        resp = session.post(search_url, headers=headers, json=payload, timeout=15)
         print(f"[DEBUG] Statut HTTP recherche : {resp.status_code}")
         print(f"[DEBUG] Response recherche : {resp.text}")
         
@@ -215,8 +255,66 @@ def search_existing_lead(external_id: str) -> list:
         result = resp.json()
         print(f"[DEBUG] IDs trouvés : {result}")
         return result if isinstance(result, list) else []
+    except requests.exceptions.ConnectionError as e:
+        print(f"[ERROR] Connection Error lors de la recherche: {e}")
+        raise RuntimeError(f"Impossible de se connecter à Odoo: {str(e)}")
+    except requests.exceptions.Timeout as e:
+        print(f"[ERROR] Timeout lors de la recherche: {e}")
+        raise RuntimeError(f"Timeout de connexion à Odoo (15s dépassé): {str(e)}")
     except Exception as e:
         print(f"[ERROR] Erreur lors de la recherche : {e}")
+        raise
+
+
+def create_mail_writer_task(first_name: str, last_name: str, email: str, website: str, partner_name: str, function: str, description: str) -> dict:
+    """
+    Crée une task dans Google Cloud Tasks pour générer un mail de prospection.
+    La task appelle le service mail-writer avec les infos du prospect.
+    """
+    if not GCP_PROJECT_ID:
+        raise RuntimeError("GCP_PROJECT_ID n'est pas défini dans les variables d'environnement")
+    if not MAIL_WRITER_ENDPOINT:
+        raise RuntimeError("MAIL_WRITER_ENDPOINT n'est pas défini dans les variables d'environnement")
+
+    try:
+        client = tasks_v2.CloudTasksClient()
+        parent = client.queue_path(GCP_PROJECT_ID, GCP_REGION, CLOUD_TASKS_QUEUE)
+
+        # Construire le payload de la task
+        task_payload = {
+            "first_name": first_name,
+            "last_name": last_name,
+            "email": email,
+            "website": website,
+            "partner_name": partner_name,
+            "function": function,
+            "description": description
+        }
+
+        task = {
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": MAIL_WRITER_ENDPOINT,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps(task_payload).encode()
+            }
+        }
+
+        print(f"[DEBUG] Création de task Cloud Tasks")
+        print(f"[DEBUG] Queue: {parent}")
+        print(f"[DEBUG] Endpoint: {MAIL_WRITER_ENDPOINT}")
+        print(f"[DEBUG] Payload: {task_payload}")
+
+        response = client.create_task(request={"parent": parent, "task": task})
+        
+        print(f"[DEBUG] Task créée avec succès : {response.name}")
+        return {
+            "status": "task_created",
+            "task_name": response.name
+        }
+
+    except Exception as e:
+        print(f"[ERROR] Erreur lors de la création de la task : {e}")
         raise
 
 
@@ -234,6 +332,7 @@ def send_to_odoo(vals_list_payload: dict) -> dict:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {ODOO_SECRET}",
+        "Connection": "keep-alive"
     }
 
     print(f"[DEBUG] Envoi vers Odoo : {ODOO_FULL_URL}")
@@ -241,7 +340,8 @@ def send_to_odoo(vals_list_payload: dict) -> dict:
     print(f"[DEBUG] Headers : Content-Type={headers.get('Content-Type')}, Auth={'Bearer ' + '*' * 10 + '...'}")
 
     try:
-        resp = requests.post(ODOO_FULL_URL, headers=headers, json=vals_list_payload, timeout=10)
+        session = create_requests_session()
+        resp = session.post(ODOO_FULL_URL, headers=headers, json=vals_list_payload, timeout=15)
         print(f"[DEBUG] Statut HTTP réponse : {resp.status_code}")
         print(f"[DEBUG] Headers réponse : {resp.headers}")
         print(f"[DEBUG] Body réponse (raw) : {resp.text}")
@@ -252,6 +352,12 @@ def send_to_odoo(vals_list_payload: dict) -> dict:
             return resp.json()
         except ValueError:
             return {"raw_response": resp.text}
+    except requests.exceptions.ConnectionError as e:
+        print(f"[ERROR] Connection Error : {e}")
+        raise RuntimeError(f"Impossible de se connecter à Odoo: {str(e)}")
+    except requests.exceptions.Timeout as e:
+        print(f"[ERROR] Timeout : {e}")
+        raise RuntimeError(f"Timeout de connexion à Odoo (15s dépassé): {str(e)}")
     except requests.exceptions.HTTPError as e:
         print(f"[ERROR] HTTP Error : {e}")
         print(f"[ERROR] Status code : {e.response.status_code}")
@@ -287,7 +393,10 @@ def webhook():
     try:
         # Vérifier si les leads existent déjà avant de les créer
         checked_vals = []
-        for val in vals_payload.get("vals_list", []):
+        lead_items = []  # Pour stocker les items originaux avec checked_vals
+        
+        for item in payload.get("data", []):
+            val = pharow_item_to_odoo_lead(item)
             external_id = val.get("x_external_id")
             if external_id:
                 existing_leads = search_existing_lead(external_id)
@@ -302,8 +411,10 @@ def webhook():
                 else:
                     print(f"[INFO] Lead avec external_id '{external_id}' n'existe pas, création...")
                     checked_vals.append(val)
+                    lead_items.append(item)
             else:
                 checked_vals.append(val)
+                lead_items.append(item)
         
         # Créer seulement les leads qui n'existent pas
         if checked_vals:
@@ -312,6 +423,42 @@ def webhook():
             print("──── Réponse Odoo ──────────")
             print(odoo_response)
             print("─────────────────────────────")
+            
+            # Créer une task Cloud Tasks pour chaque lead créé
+            tasks_created = []
+            for item in lead_items:
+                try:
+                    person = item.get("person", {}) or {}
+                    company = item.get("company", {}) or {}
+                    position = item.get("position", {}) or {}
+                    
+                    first_name = person.get("personFirstName", "") or ""
+                    last_name = person.get("personLastName", "") or ""
+                    email = position.get("positionEmail") or company.get("companyGenericEmail") or ""
+                    website = company.get("companyUrl", "") or ""
+                    partner_name = company.get("companyName", "") or ""
+                    function = position.get("positionJobTitle", "") or ""
+                    description = company.get("companyActivity", "") or ""
+                    
+                    task_result = create_mail_writer_task(
+                        first_name,
+                        last_name,
+                        email,
+                        website,
+                        partner_name,
+                        function,
+                        description
+                    )
+                    tasks_created.append(task_result)
+                    
+                except Exception as task_error:
+                    print(f"[WARNING] Erreur lors de la création de la task mail-writer : {task_error}")
+                    tasks_created.append({"status": "error", "error": str(task_error)})
+            
+            # Ajouter les tasks créées à la réponse
+            if "tasks_created" not in odoo_response:
+                odoo_response["tasks_created"] = tasks_created
+                
         elif not odoo_response:
             odoo_response = {"status": "skipped", "reason": "All leads already exist"}
             odoo_status = "skipped"
@@ -325,6 +472,30 @@ def webhook():
         print(f"[ERROR] Message: {str(e)}")
         import traceback
         print(f"[ERROR] Traceback:\n{traceback.format_exc()}")
+        
+        # Si c'est une erreur de connexion, on peut essayer un retry une fois
+        if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+            print("[INFO] Tentative de retry après erreur de connexion...")
+            try:
+                # Réessayer une seule fois après un court délai
+                import time
+                time.sleep(2)
+                
+                checked_vals = []
+                for item in payload.get("data", []):
+                    val = pharow_item_to_odoo_lead(item)
+                    checked_vals.append(val)
+                
+                if checked_vals:
+                    filtered_payload = {"vals_list": checked_vals}
+                    odoo_response = send_to_odoo(filtered_payload)
+                    odoo_status = "ok"
+                    print("[INFO] Retry successful après reconnexion")
+                    
+            except Exception as retry_error:
+                print(f"[ERROR] Retry échoué : {retry_error}")
+                odoo_response = {"error": f"Erreur après retry: {str(retry_error)}"}
+                odoo_status = "error"
 
     return jsonify({
         "status": "ok",               # pour Pharow

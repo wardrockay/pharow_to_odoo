@@ -266,7 +266,7 @@ def search_existing_lead(external_id: str) -> list:
         raise
 
 
-def create_mail_writer_task(first_name: str, last_name: str, email: str, website: str, partner_name: str, function: str, description: str) -> dict:
+def create_mail_writer_task(first_name: str, last_name: str, email: str, website: str, partner_name: str, function: str, description: str, x_external_id: str = "") -> dict:
     """
     Crée une task dans Google Cloud Tasks pour générer un mail de prospection.
     La task appelle le service mail-writer avec les infos du prospect.
@@ -288,7 +288,8 @@ def create_mail_writer_task(first_name: str, last_name: str, email: str, website
             "website": website,
             "partner_name": partner_name,
             "function": function,
-            "description": description
+            "description": description,
+            "x_external_id": x_external_id
         }
 
         task = {
@@ -439,6 +440,7 @@ def webhook():
                     partner_name = company.get("companyName", "") or ""
                     function = position.get("positionJobTitle", "") or ""
                     description = company.get("companyActivity", "") or ""
+                    x_external_id = company.get("pharowCompanyId", "") or ""
                     
                     task_result = create_mail_writer_task(
                         first_name,
@@ -447,7 +449,8 @@ def webhook():
                         website,
                         partner_name,
                         function,
-                        description
+                        description,
+                        x_external_id
                     )
                     tasks_created.append(task_result)
                     

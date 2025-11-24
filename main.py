@@ -266,7 +266,7 @@ def search_existing_lead(external_id: str) -> list:
         raise
 
 
-def create_mail_writer_task(first_name: str, last_name: str, email: str, website: str, partner_name: str, function: str, description: str, x_external_id: str = "") -> dict:
+def create_mail_writer_task(first_name: str, last_name: str, email: str, website: str, partner_name: str, function: str, description: str, x_external_id: str = "", odoo_id: int = None) -> dict:
     """
     Crée une task dans Google Cloud Tasks pour générer un mail de prospection.
     La task appelle le service mail-writer avec les infos du prospect.
@@ -291,6 +291,10 @@ def create_mail_writer_task(first_name: str, last_name: str, email: str, website
             "description": description,
             "x_external_id": x_external_id
         }
+        
+        # Ajouter odoo_id s'il est fourni
+        if odoo_id is not None:
+            task_payload["odoo_id"] = odoo_id
 
         task = {
             "http_request": {
@@ -425,9 +429,20 @@ def webhook():
             print(odoo_response)
             print("─────────────────────────────")
             
+            # Extraire les IDs Odoo créés depuis la réponse
+            # Odoo renvoie une liste d'IDs comme [227, 228, ...]
+            odoo_ids = []
+            if isinstance(odoo_response, list):
+                odoo_ids = odoo_response
+            elif isinstance(odoo_response, dict) and "result" in odoo_response:
+                # Au cas où la réponse serait wrappée dans un dict
+                odoo_ids = odoo_response.get("result", [])
+            
+            print(f"[DEBUG] IDs Odoo extraits : {odoo_ids}")
+            
             # Créer une task Cloud Tasks pour chaque lead créé
             tasks_created = []
-            for item in lead_items:
+            for idx, item in enumerate(lead_items):
                 try:
                     person = item.get("person", {}) or {}
                     company = item.get("company", {}) or {}
@@ -442,6 +457,10 @@ def webhook():
                     description = company.get("companyActivity", "") or ""
                     x_external_id = company.get("pharowCompanyId", "") or ""
                     
+                    # Récupérer l'ID Odoo correspondant (même index que dans lead_items)
+                    odoo_id = odoo_ids[idx] if idx < len(odoo_ids) else None
+                    print(f"[DEBUG] Création task pour lead {idx}: odoo_id={odoo_id}, x_external_id={x_external_id}")
+                    
                     task_result = create_mail_writer_task(
                         first_name,
                         last_name,
@@ -450,7 +469,8 @@ def webhook():
                         partner_name,
                         function,
                         description,
-                        x_external_id
+                        x_external_id,
+                        odoo_id
                     )
                     tasks_created.append(task_result)
                     
